@@ -88,6 +88,9 @@ type SafeFormatAndMount struct {
 // disk is already formatted or it is being mounted as read-only, it
 // will be mounted without formatting.
 func (mounter *SafeFormatAndMount) FormatAndMount(source string, target string, fstype string, options []string) error {
+	if fstype == "zfs" {
+		return mounter.formatAndMountZfs(source, target, fstype, options)
+	}
 	return mounter.formatAndMount(source, target, fstype, options)
 }
 

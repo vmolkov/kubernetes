@@ -31,6 +31,8 @@ import (
 	"k8s.io/klog"
 	utilexec "k8s.io/utils/exec"
 	utilio "k8s.io/utils/io"
+	guuid "github.com/google/uuid"
+	dmount "github.com/docker/docker/pkg/mount"
 )
 
 const (
@@ -72,7 +74,13 @@ func New(mounterPath string) Interface {
 func (mounter *Mounter) Mount(source string, target string, fstype string, options []string) error {
 	// Path to mounter binary if containerized mounter is needed. Otherwise, it is set to empty.
 	// All Linux distros are expected to be shipped with a mount utility that a support bind mounts.
+
 	mounterPath := ""
+	//dirty hack, skipping all following code if zfs is used
+	if fstype == "zfs" {
+		return mounter.doMount(mounterPath, defaultMountCommand, source, target, fstype, options)
+	}
+
 	bind, bindOpts, bindRemountOpts := MakeBindOpts(options)
 	if bind {
 		err := mounter.doMount(mounterPath, defaultMountCommand, source, target, fstype, bindOpts)
@@ -96,7 +104,13 @@ func (mounter *Mounter) Mount(source string, target string, fstype string, optio
 
 // doMount runs the mount command. mounterPath is the path to mounter binary if containerized mounter is used.
 func (mounter *Mounter) doMount(mounterPath string, mountCmd string, source string, target string, fstype string, options []string) error {
-	mountArgs := MakeMountArgs(source, target, fstype, options)
+	mountArgs := []string{}
+	if fstype == "zfs" {
+		mountCmd = "zfs"
+		mountArgs = MakeZfsMountArgs(source, target, fstype, options)
+	} else {
+		mountArgs = MakeMountArgs(source, target, fstype, options)
+	}
 	if len(mounterPath) > 0 {
 		mountArgs = append([]string{mountCmd}, mountArgs...)
 		mountCmd = mounterPath
@@ -169,6 +183,25 @@ func detectSystemd() bool {
 	return true
 }
 
+func MakeZfsMountArgs(source, target, fstype string, options []string) []string {
+	// Build mount command as follows:
+	//   zfs set  [-o $option] [-o $option] -o mountpoint=$target $source
+	mountArgs := []string{}
+	if len(options) > 0 {
+		for _, option := range options {
+			if strings.HasPrefix(option, "mountpoint=") {
+				klog.Infof("mountpoint property is found - %s , it will be ignored", option)
+				continue
+			}
+			mountArgs = append(mountArgs, option)
+		}
+	}
+	mountArgs = append(mountArgs, "mountpoint="+target)
+	mountArgs = append(mountArgs, source)
+
+	return mountArgs
+}
+
 // MakeMountArgs makes the arguments to the mount(8) command.
 // Implementation is shared with NsEnterMounter
 func MakeMountArgs(source, target, fstype string, options []string) []string {
@@ -197,15 +230,63 @@ func AddSystemdScope(systemdRunPath, mountName, command string, args []string) (
 	return systemdRunPath, append(systemdRunArgs, args...)
 }
 
+// getZpoolNameForMountpoint checks if zfs mounted on mountpoint and returns zpool name
+// else returns ""
+func getZpoolNameForMountpoint(mountpoint string) (string, error) {
+	fstype := ""
+	source := ""
+	mounts, err := dmount.GetMounts(nil)
+	if err != nil {
+		klog.Errorf("Failed to get list of mounts, error: %s", err)
+		return "", err
+	}
+	for _, mount := range mounts {
+		if mountpoint == mount.Mountpoint {
+			fstype = mount.Fstype
+			source = mount.Source
+			break
+		}
+	}
+	if fstype != "zfs" {
+		klog.Infof("%s filesystem mounted in %s", fstype, mountpoint)
+		return "", nil
+	}
+	klog.Infof("Finded pool %s mounted on %s", source, mountpoint)
+	return source, nil
+}
+
+// exportZpool exports zpool
+func exportZpool(pool_name string) error {
+	klog.Infof("Exporting %s", pool_name)
+	command := exec.Command("zpool", "export", pool_name)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		klog.Errorf("Export failed: %v\nPool: %s\nOutput: %s", err, pool_name, string(output))
+		return fmt.Errorf("export failed: %v\nPool: %s\nOutput: %s", err, pool_name, string(output))
+	}
+	klog.Infof("Zfs pool successfully exported %s", pool_name)
+	return nil
+}
+
 // Unmount unmounts the target.
 func (mounter *Mounter) Unmount(target string) error {
 	klog.V(4).Infof("Unmounting %s", target)
+	pool_name, err := getZpoolNameForMountpoint(target)
+	if err != nil {
+		return err
+	}
+
 	command := exec.Command("umount", target)
 	output, err := command.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("unmount failed: %v\nUnmounting arguments: %s\nOutput: %s", err, target, string(output))
 	}
-	return nil
+
+	if pool_name == "" {
+		return nil
+	}
+	klog.Infof("Trying to export zfs pool %s", pool_name)
+	return exportZpool(pool_name)
 }
 
 // List returns a list of all mounted filesystems.
@@ -256,6 +337,151 @@ func (mounter *Mounter) GetMountRefs(pathname string) ([]string, error) {
 	}
 	return SearchMountPoints(realpath, procMountInfoPath)
 }
+
+// searchForExportedZpool searches zpool by source which can be imported
+// function returns zpool's id if zpool found else ""
+func searchForExportedZpool(source string) (string, error) {
+	source_dir := filepath.Dir(source)
+	source_base := filepath.Base(source)
+
+	command := exec.Command("zpool", "import", "-d", source_dir)
+	out, err := command.CombinedOutput()
+
+	if err != nil {
+		klog.Errorf("Failed to get list of inactive pools, error:(%s)", err)
+		return "", err
+	}
+	out_string := string(out)
+	pools := strings.Split(out_string, "   pool: ")
+	for _, pool := range pools[1:] {
+		lines := strings.Split(pool, "\n")
+		if len(lines) < 8 {
+			return "", errors.New("unknown 'zpool import' output format")
+		}
+		name, id, online, ready, source_found := "", "", false, false, false
+		for index, line := range lines {
+			if index == 0 {
+				name = line
+			} else if strings.Contains(line, "id: ") {
+				id = strings.Split(lines[1], "id: ")[1]
+			} else if strings.Contains(line, "state: ONLINE") {
+				online = true
+			} else if strings.Contains(line, "action: The pool can be imported using its name or numeric identifier.") {
+				ready = true
+			} else if strings.Contains(line, "ONLINE") && strings.Contains(line, source_base+" ") {
+				source_found = true
+			}
+		}
+
+		if len(name) > 0 && len(id) > 0 && online == true && ready == true && source_found == true {
+			klog.Infof("Finded inactive pool! name: %s, id: %s, source: %s", name, id, source)
+			return id, nil
+		}
+	}
+	klog.Infof("Cannot find inactive pool by source: %s", source)
+	return "", nil
+}
+
+// getActiveZpools returns slice of zpool zpool names
+func getActiveZpools() ([]string, error) {
+	command := exec.Command("zpool", "list", "-H", "-o", "name")
+	out, err := command.CombinedOutput()
+
+	if err != nil {
+		klog.Errorf("Failed to get list of active pools, error:(%s)", err)
+		return nil, err
+	}
+	out_string := string(out)
+	pools := strings.Split(out_string, "\n")
+	if len(pools) > 0 {
+		pools = pools[:len(pools)-1]
+	}
+	klog.Infof("Currently active zfs pools: %s", strings.Join(pools[:], ", "))
+	return pools, nil
+}
+
+// generateNewZpoolName returns unique zpool name depends on currently active zpool names
+func generateNewZpoolName(active_pools []string) (string) {
+	for {
+		can_return := true
+		new_pool_name := guuid.New().String()
+		// fir for 'name must begin with a letter' error
+		new_pool_name = "k8s-"+new_pool_name
+		for _, pool_name := range active_pools {
+			if new_pool_name == pool_name {
+				can_return = false
+				break
+			}
+		}
+		if can_return == true {
+			klog.Infof("New pool name generated: %s", new_pool_name)
+			return new_pool_name
+		}
+	}
+}
+
+
+// initializeZfsPool initializes zfs pool with workflow:
+// 1. get list of active zpools
+// 2. using list of active zpool denerate unique zpool name
+// 3. search zpool by source in output of `zpool import -d {{ source | dir }}`
+// 4. if pool found: import pool using new zpool name
+// 5. else: create new zpool using new zpool name
+// TODO: add case when zpool is currenty active (imported)
+func initializeZfsPool(source string) (string, error) {
+	// 1. get list of active zpools
+	active_pools, err := getActiveZpools()
+	if err != nil {
+		return "", err
+	}
+
+	// 2. using list of active zpool denerate unique zpool name
+	new_pool_name := generateNewZpoolName(active_pools)
+
+	// 3. search zpool by source in output of `zpool import -d {{ source | dir }}`
+	pool_id, err := searchForExportedZpool(source)
+	if err != nil {
+		return "", err
+	}
+
+	pool_init_args := []string{}
+	if len(pool_id) > 0 {
+		// 4. if pool found: import pool using new zpool name
+		klog.Infof("Tring to import zpool: %s (%s)", new_pool_name, source)
+		source_dir := filepath.Dir(source)
+		pool_init_args = []string{"import", "-d", source_dir, pool_id, new_pool_name}
+	} else {
+		// 5. else: create new zpool using new zpool name
+		klog.Infof("Tring to create zpool: %s (%s)", new_pool_name, source)
+		pool_init_args = []string{"create", new_pool_name, source}
+	}
+	command := exec.Command("zpool", pool_init_args...)
+	_, err = command.CombinedOutput()
+	if err != nil {
+		klog.Errorf("Failed to initialize zpool %s, init args: (%s) error:(%s)", source, strings.Join(pool_init_args[:], " "), err)
+		return "", err
+	}
+	klog.Infof("Zpool successfully initialized: %s (%s)", new_pool_name, source)
+	return new_pool_name, nil
+}
+
+
+// formatAndMountZfs initializes zfs pool and mount it
+// TODO: add readonly behaviour
+// TODO: add fs check
+// TODO: add automatic resize
+func (mounter *SafeFormatAndMount) formatAndMountZfs(source string, target string, fstype string, options []string) error {
+	klog.Infof("Tring to initialize ZFS pool using source: %s", source)
+	// TODO: add readonly behaviour
+	pool_name, err := initializeZfsPool(source)
+	if err != nil {
+		return err
+	}
+	// TODO: add fs check
+	// TODO: add automatic resize
+	return mounter.Interface.Mount(pool_name, target, fstype, options)
+}
+
 
 // formatAndMount uses unix utils to format and mount the given disk
 func (mounter *SafeFormatAndMount) formatAndMount(source string, target string, fstype string, options []string) error {
